@@ -381,6 +381,86 @@ func (s *LoggingInterceptorTestSuite) TestLoggingServerInterceptor_SlowRequests(
 	s.Require().True(found)
 }
 
+func (s *LoggingInterceptorTestSuite) TestLoggingServerInterceptor_ExcludedTimeSlots() {
+	const headerRequestID = "test-request-id"
+	const slowCallThreshold = 100 * time.Millisecond
+	const timeSlotsThreshold = 100 * time.Millisecond
+	const handlerDuration = slowCallThreshold * 2
+
+	tests := []struct {
+		name            string
+		excludeSlot     bool
+		wantSlowRequest bool
+		wantTimeSlots   bool
+	}{
+		{
+			name:            "regular time slot, full duration is used",
+			wantSlowRequest: true,
+			wantTimeSlots:   true,
+		},
+		{
+			name:        "excluded time slot drops duration below the thresholds",
+			excludeSlot: true,
+		},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			logger := logtest.NewRecorder()
+			setupParams := func(params *LoggingParams) {
+				time.Sleep(handlerDuration)
+				if tt.excludeSlot {
+					params.AddExcludedTimeSlotDurationInMs("external_request_ms", handlerDuration)
+				} else {
+					params.AddTimeSlotDurationInMs("external_request_ms", handlerDuration)
+				}
+			}
+			_, client, closeSvc, err := s.setupTestServiceWithLoggingParamsHandlerAndOptions(logger, setupParams,
+				[]LoggingOption{
+					WithLoggingSlowCallThreshold(slowCallThreshold),
+					WithLoggingTimeSlotsThreshold(timeSlotsThreshold),
+				})
+			s.Require().NoError(err)
+			defer func() { s.Require().NoError(closeSvc()) }()
+
+			reqCtx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(headerRequestIDKey, headerRequestID))
+			if s.IsUnary {
+				_, err = client.UnaryCall(reqCtx, &grpc_testing.SimpleRequest{})
+				s.Require().NoError(err)
+			} else {
+				stream, streamErr := client.StreamingOutputCall(reqCtx, &grpc_testing.StreamingOutputCallRequest{})
+				s.Require().NoError(streamErr)
+				_, recvErr := stream.Recv()
+				s.Require().NoError(recvErr)
+			}
+
+			s.Require().Equal(1, len(logger.Entries()))
+			logEntry := logger.Entries()[0]
+			s.Require().Contains(logEntry.Text, "gRPC call finished")
+
+			_, found := logEntry.FindField("slow_request")
+			s.Require().Equal(tt.wantSlowRequest, found)
+
+			_, found = logEntry.FindField("time_slots")
+			s.Require().Equal(tt.wantTimeSlots, found)
+
+			// The total duration is always reported as is, regardless of the exclusions.
+			durationField, found := logEntry.FindField("duration_ms")
+			s.Require().True(found)
+			s.Require().GreaterOrEqual(durationField.Int, handlerDuration.Milliseconds())
+
+			excludedField, excludedFound := logEntry.FindField("excluded_duration_ms")
+			effectiveField, effectiveFound := logEntry.FindField("effective_duration_ms")
+			s.Require().Equal(tt.excludeSlot, excludedFound)
+			s.Require().Equal(tt.excludeSlot, effectiveFound)
+			if tt.excludeSlot {
+				s.Require().GreaterOrEqual(excludedField.Int, handlerDuration.Milliseconds())
+				s.Require().Less(effectiveField.Int, slowCallThreshold.Milliseconds())
+			}
+		})
+	}
+}
+
 func (s *LoggingInterceptorTestSuite) TestLoggingServerInterceptor_LoggingParams() {
 	const headerRequestID = "test-request-id"
 	const slowCallThreshold = 10 * time.Millisecond

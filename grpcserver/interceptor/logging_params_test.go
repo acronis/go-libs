@@ -7,6 +7,8 @@ Released under MIT license.
 package interceptor
 
 import (
+	"bytes"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/acronis/go-appkit/log"
+	"github.com/acronis/go-appkit/log/logtest"
 )
 
 // LoggingParamsTestSuite is a test suite for LoggingParams
@@ -50,6 +53,73 @@ func (s *LoggingParamsTestSuite) TestExtendFields() {
 	s.Require().Equal("value4", string(lp.fields[3].Bytes))
 }
 
+func (s *LoggingParamsTestSuite) TestExcludedDuration() {
+	s.Run("no time slots at all", func() {
+		lp := &LoggingParams{}
+		s.Require().Zero(lp.excludedDuration())
+	})
+
+	s.Run("only regular time slots", func() {
+		lp := &LoggingParams{}
+		lp.AddTimeSlotInt("slot1", 100)
+		lp.AddTimeSlotDurationInMs("slot2", 2*time.Second)
+		s.Require().Zero(lp.excludedDuration())
+	})
+
+	s.Run("excluded time slots are added to time_slots map too", func() {
+		lp := &LoggingParams{}
+		lp.AddTimeSlotInt("slot1", 100)
+		lp.AddExcludedTimeSlotInt("slot2", 200)
+		lp.AddExcludedTimeSlotDurationInMs("slot3", 300*time.Millisecond)
+
+		s.Require().Equal(loggableIntMap{
+			"slot1": 100 * time.Millisecond,
+			"slot2": 200 * time.Millisecond,
+			"slot3": 300 * time.Millisecond,
+		}, lp.getTimeSlots())
+		s.Require().Equal(500*time.Millisecond, lp.excludedDuration())
+	})
+
+	s.Run("sub-millisecond slots are not truncated away", func() {
+		lp := &LoggingParams{}
+		for i := 0; i < 2000; i++ {
+			lp.AddExcludedTimeSlotDurationInMs("slot", 900*time.Microsecond)
+		}
+		s.Require().Equal(1800*time.Millisecond, lp.excludedDuration())
+		s.Require().Equal(loggableIntMap{"slot": 1800 * time.Millisecond}, lp.getTimeSlots())
+	})
+
+	s.Run("same slot added as excluded and not", func() {
+		lp := &LoggingParams{}
+		lp.AddTimeSlotInt("slot1", 100)
+		lp.AddExcludedTimeSlotInt("slot1", 200)
+
+		s.Require().Equal(loggableIntMap{"slot1": 300 * time.Millisecond}, lp.getTimeSlots())
+		s.Require().Equal(200*time.Millisecond, lp.excludedDuration())
+	})
+
+	s.Run("concurrent adding", func() {
+		const goroutines = 32
+		lp := &LoggingParams{}
+		var wg sync.WaitGroup
+		wg.Add(goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				defer wg.Done()
+				lp.AddTimeSlotInt("slot", 1)
+				lp.AddExcludedTimeSlotInt("excluded_slot", 1)
+			}()
+		}
+		wg.Wait()
+
+		s.Require().Equal(loggableIntMap{
+			"slot":          goroutines * time.Millisecond,
+			"excluded_slot": goroutines * time.Millisecond,
+		}, lp.getTimeSlots())
+		s.Require().Equal(goroutines*time.Millisecond, lp.excludedDuration())
+	})
+}
+
 func (s *LoggingParamsTestSuite) TestAddTimeSlotInt() {
 	lp := &LoggingParams{}
 
@@ -59,14 +129,14 @@ func (s *LoggingParamsTestSuite) TestAddTimeSlotInt() {
 
 	timeSlots := lp.getTimeSlots()
 	s.Require().Len(timeSlots, 2)
-	s.Require().Equal(int64(100), timeSlots["slot1"])
-	s.Require().Equal(int64(200), timeSlots["slot2"])
+	s.Require().Equal(100*time.Millisecond, timeSlots["slot1"])
+	s.Require().Equal(200*time.Millisecond, timeSlots["slot2"])
 
 	// Test adding to existing slot (should accumulate)
 	lp.AddTimeSlotInt("slot1", 50)
 	timeSlots = lp.getTimeSlots()
-	s.Require().Equal(int64(150), timeSlots["slot1"])
-	s.Require().Equal(int64(200), timeSlots["slot2"])
+	s.Require().Equal(150*time.Millisecond, timeSlots["slot1"])
+	s.Require().Equal(200*time.Millisecond, timeSlots["slot2"])
 }
 
 func (s *LoggingParamsTestSuite) TestAddTimeSlotDurationInMs() {
@@ -78,13 +148,13 @@ func (s *LoggingParamsTestSuite) TestAddTimeSlotDurationInMs() {
 
 	timeSlots := lp.getTimeSlots()
 	s.Require().Len(timeSlots, 2)
-	s.Require().Equal(int64(1000), timeSlots["slot1"]) // 1 second = 1000ms
-	s.Require().Equal(int64(2000), timeSlots["slot2"]) // 2 seconds = 2000ms
+	s.Require().Equal(1*time.Second, timeSlots["slot1"])
+	s.Require().Equal(2*time.Second, timeSlots["slot2"])
 
 	// Test adding to existing slot (should accumulate)
 	lp.AddTimeSlotDurationInMs("slot1", 500*time.Millisecond)
 	timeSlots = lp.getTimeSlots()
-	s.Require().Equal(int64(1500), timeSlots["slot1"]) // 1000 + 500 = 1500ms
+	s.Require().Equal(1500*time.Millisecond, timeSlots["slot1"])
 }
 
 func (s *LoggingParamsTestSuite) TestConcurrentAccess() {
@@ -112,10 +182,10 @@ func (s *LoggingParamsTestSuite) TestConcurrentAccess() {
 	timeSlots := lp.getTimeSlots()
 	s.Require().Len(timeSlots, 1)
 
-	// Expected value: sum of (0+1+2+...+9) * 100 = 45 * 100 = 4500
-	expectedSum := int64(0)
+	// Expected value: sum of (0+1+2+...+9) * 100 = 45 * 100 = 4500ms
+	expectedSum := time.Duration(0)
 	for i := 0; i < 10; i++ {
-		expectedSum += int64(i) * 100
+		expectedSum += time.Duration(i) * 100 * time.Millisecond
 	}
 	s.Require().Equal(expectedSum, timeSlots["concurrent_slot"])
 }
@@ -150,22 +220,29 @@ func (s *LoggingParamsTestSuite) TestMixedUsage() {
 	// Check time slots
 	timeSlots := lp.getTimeSlots()
 	s.Require().Len(timeSlots, 2)
-	s.Require().Equal(int64(100), timeSlots["slot1"])
-	s.Require().Equal(int64(1000), timeSlots["slot2"])
+	s.Require().Equal(100*time.Millisecond, timeSlots["slot1"])
+	s.Require().Equal(1*time.Second, timeSlots["slot2"])
 }
 
 func (s *LoggingParamsTestSuite) TestLoggableIntMapEncodeLogfObject() {
 	lim := loggableIntMap{
-		"slot1": 100,
-		"slot2": 200,
-		"slot3": 300,
+		"slot1": 100 * time.Millisecond,
+		"slot2": 200 * time.Millisecond,
+		"slot3": 1500 * time.Microsecond,
 	}
 
 	// Test that the map is not nil and has expected values
 	s.Require().Len(lim, 3)
-	s.Require().Equal(int64(100), lim["slot1"])
-	s.Require().Equal(int64(200), lim["slot2"])
-	s.Require().Equal(int64(300), lim["slot3"])
+	s.Require().Equal(100*time.Millisecond, lim["slot1"])
+	s.Require().Equal(200*time.Millisecond, lim["slot2"])
+
+	// Durations are kept at full precision, but encoded as integer milliseconds.
+	var buf bytes.Buffer
+	logtest.NewLoggerWithOpts(logtest.LoggerOpts{Output: &buf}).
+		Info("test", log.Field{Key: "time_slots", Type: logf.FieldTypeObject, Any: lim})
+	s.Require().Contains(buf.String(), `"slot1":100`)
+	s.Require().Contains(buf.String(), `"slot2":200`)
+	s.Require().Contains(buf.String(), `"slot3":1`)
 }
 
 func (s *LoggingParamsTestSuite) TestLoggableIntMapEncodeLogfObjectEmpty() {
@@ -194,8 +271,8 @@ func (s *LoggingParamsTestSuite) TestIntegration() {
 
 	timeSlots := lp.getTimeSlots()
 	s.Require().Len(timeSlots, 2)
-	s.Require().Equal(int64(75), timeSlots["db_query"])      // 50 + 25 = 75ms
-	s.Require().Equal(int64(100), timeSlots["external_api"]) // 100ms
+	s.Require().Equal(75*time.Millisecond, timeSlots["db_query"]) // 50 + 25 = 75ms
+	s.Require().Equal(100*time.Millisecond, timeSlots["external_api"])
 
 	// Test creating the time_slots field for logging
 	lp.fields = append(lp.fields, log.Field{
