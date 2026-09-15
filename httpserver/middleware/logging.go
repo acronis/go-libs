@@ -101,16 +101,7 @@ func (h *loggingHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		log.String(userAgentLogFieldKey, r.UserAgent()),
 	)
 
-	if addrIP, addrPort, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		logFields = append(logFields, log.String("remote_addr_ip", addrIP))
-		if port, pErr := strconv.ParseUint(addrPort, 10, 16); pErr == nil {
-			logFields = append(logFields, log.Uint16("remote_addr_port", uint16(port)))
-		}
-	}
-
-	if originAddr := getOriginAddr(r); originAddr != "" {
-		logFields = append(logFields, log.String("origin_addr", originAddr))
-	}
+	logFields = addRemoteOriginAddrFields(logFields, r)
 
 	for reqHeaderName, logKey := range h.opts.RequestHeaders {
 		logFields = append(logFields, log.String(logKey, r.Header.Get(reqHeaderName)))
@@ -133,27 +124,46 @@ func (h *loggingHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	h.next.ServeHTTP(wrw, r)
 
 	if !noLog || wrw.Status() >= http.StatusBadRequest {
-		duration := time.Since(startTime)
-		if duration >= h.opts.TimeSlotsThreshold {
+		// totalDuration - for logging of total request time
+		// effectiveDuration - for calculating the thresholds
+		totalDuration, excludedDuration, effectiveDuration := calculateDurations(startTime, lp)
+		if effectiveDuration >= h.opts.TimeSlotsThreshold {
 			lp.AddTimeSlotDurationInMs("writing_response_ms", wrw.ElapsedTime())
 			lp.fields = append(
 				lp.fields,
 				log.Field{Key: "time_slots", Type: logf.FieldTypeObject, Any: lp.getTimeSlots()},
 			)
 		}
-		if duration >= h.opts.SlowRequestThreshold {
+		if effectiveDuration >= h.opts.SlowRequestThreshold {
 			lp.fields = append(lp.fields, log.Bool("slow_request", true))
 		}
+		durationFields := []log.Field{
+			log.Int64("duration_ms", totalDuration.Milliseconds()),
+			log.DurationIn(totalDuration, time.Microsecond), // For backward compatibility, will be removed in the future.
+			log.Int("status", wrw.Status()),
+			log.Int("bytes_sent", wrw.BytesWritten()),
+		}
+		if excludedDuration > 0 {
+			durationFields = append(
+				durationFields,
+				log.Int64("excluded_duration_ms", excludedDuration.Milliseconds()),
+				log.Int64("effective_duration_ms", effectiveDuration.Milliseconds()),
+			)
+		}
 		logger.Info(
-			fmt.Sprintf("response completed in %.3fs", duration.Seconds()),
-			append([]log.Field{
-				log.Int64("duration_ms", duration.Milliseconds()),
-				log.DurationIn(duration, time.Microsecond), // For backward compatibility, will be removed in the future.
-				log.Int("status", wrw.Status()),
-				log.Int("bytes_sent", wrw.BytesWritten()),
-			}, lp.fields...)...,
+			fmt.Sprintf("response completed in %.3fs", totalDuration.Seconds()),
+			append(durationFields, lp.fields...)...,
 		)
 	}
+}
+
+func calculateDurations(start time.Time, lp *LoggingParams) (total, excluded, effective time.Duration) {
+	total = time.Since(start)
+	excluded = lp.excludedDuration()
+	if e := total - excluded; e > 0 {
+		effective = e
+	}
+	return
 }
 
 func (h *loggingHandler) makeURIToLog(r *http.Request) string {
@@ -179,6 +189,19 @@ func isLoggingDisabled(urlPath string, noLogEndpoints []string) bool {
 		}
 	}
 	return false
+}
+
+func addRemoteOriginAddrFields(logFields []log.Field, r *http.Request) []log.Field {
+	if addrIP, addrPort, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		logFields = append(logFields, log.String("remote_addr_ip", addrIP))
+		if port, pErr := strconv.ParseUint(addrPort, 10, 16); pErr == nil {
+			logFields = append(logFields, log.Uint16("remote_addr_port", uint16(port)))
+		}
+	}
+	if originAddr := getOriginAddr(r); originAddr != "" {
+		logFields = append(logFields, log.String("origin_addr", originAddr))
+	}
+	return logFields
 }
 
 func getOriginAddr(r *http.Request) string {

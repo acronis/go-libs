@@ -214,26 +214,47 @@ func loggingServerInterceptor(
 	ctx = NewContextWithLoggingParams(NewContextWithLogger(ctx, loggerForNext), lp)
 
 	err := handler(ctx)
-	duration := time.Since(startTime)
+	// totalDuration - for logging of total call time
+	// effectiveDuration - for calculating the thresholds
+	totalDuration, excludedDuration, effectiveDuration := calculateDurations(startTime, lp)
 
 	grpcCode := status.Code(err)
 	if !noLog || grpcCode != codes.OK { // Log if not excluded or if there's an error
-		if duration >= opts.timeSlotsThreshold {
+		if effectiveDuration >= opts.timeSlotsThreshold {
 			lp.fields = append(lp.fields, log.Object("time_slots", lp.getTimeSlots()))
 		}
-		if duration >= opts.slowCallThreshold {
+		if effectiveDuration >= opts.slowCallThreshold {
 			lp.fields = append(lp.fields, log.Bool("slow_request", true))
 		}
 		logFields = append(
 			logFields,
 			log.String("grpc_code", grpcCode.String()),
-			log.Int64("duration_ms", duration.Milliseconds()),
+			log.Int64("duration_ms", totalDuration.Milliseconds()),
 		)
+		if excludedDuration > 0 {
+			logFields = append(
+				logFields,
+				log.Int64("excluded_duration_ms", excludedDuration.Milliseconds()),
+				log.Int64("effective_duration_ms", effectiveDuration.Milliseconds()),
+			)
+		}
 		if err != nil {
 			logFields = append(logFields, log.String("grpc_error", err.Error()))
 		}
-		logger.Info(fmt.Sprintf("gRPC call finished in %.3fs", duration.Seconds()), append(logFields, lp.fields...)...)
+		logger.Info(
+			fmt.Sprintf("gRPC call finished in %.3fs", totalDuration.Seconds()),
+			append(logFields, lp.fields...)...,
+		)
 	}
+}
+
+func calculateDurations(start time.Time, lp *LoggingParams) (total, excluded, effective time.Duration) {
+	total = time.Since(start)
+	excluded = lp.excludedDuration()
+	if e := total - excluded; e > 0 {
+		effective = e
+	}
+	return
 }
 
 // buildCallInfoLogFields builds the common log fields for both unary and stream interceptors
